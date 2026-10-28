@@ -6,8 +6,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-BASE_URL = "https://fapi.binance.com/fapi/v1/klines"
-SYMBOL = "BTCUSDT"
+BASE_URL = "https://open-api.bingx.com/openApi/swap/v3/quote/klines"
+SYMBOL = "BTC-USDT"
 
 INTERVALS = {
     "1m": 60_000,
@@ -18,12 +18,14 @@ INTERVALS = {
     "1d": 86_400_000,
 }
 
+LIMIT = 350
+
 
 def fetch_candles(interval, duration):
     params = urllib.parse.urlencode({
         "symbol": SYMBOL,
         "interval": interval,
-        "limit": 350,
+        "limit": LIMIT,
     })
 
     request = urllib.request.Request(
@@ -35,70 +37,86 @@ def fetch_candles(interval, duration):
     )
 
     with urllib.request.urlopen(request, timeout=25) as response:
-        rows = json.load(response)
+        payload = json.load(response)
 
-    if not isinstance(rows, list):
-        raise ValueError(f"{interval}: unexpected API response")
+    if not isinstance(payload, dict) or str(payload.get("code")) != "0":
+        raise ValueError(f"BingX {interval}: API error: {str(payload)[:250]}")
+
+    rows = payload.get("data")
+    if not isinstance(rows, list) or len(rows) < 300:
+        raise ValueError(f"BingX {interval}: insufficient candle data")
+
+    parsed = []
+
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError(f"BingX {interval}: unexpected candle format")
+
+        start = int(row["time"])
+
+        if start < 1_000_000_000_000:
+            raise ValueError(f"BingX {interval}: unexpected timestamp units")
+
+        candle = {
+            "open_time": start,
+            "close_time": start + duration - 1,
+            "open": str(row["open"]),
+            "high": str(row["high"]),
+            "low": str(row["low"]),
+            "close": str(row["close"]),
+            "volume": str(row["volume"]),
+        }
+
+        if not (
+            float(candle["low"]) <= float(candle["open"]) <= float(candle["high"])
+            and float(candle["low"]) <= float(candle["close"]) <= float(candle["high"])
+        ):
+            raise ValueError(f"BingX {interval}: invalid OHLC")
+
+        parsed.append(candle)
+
+    parsed.sort(key=lambda c: c["open_time"])
 
     now_ms = int(time.time() * 1000)
-
     closed = [
-        row for row in rows
-        if int(row[6]) < now_ms
-    ][-300:]
+        c for c in parsed
+        if c["close_time"] < now_ms - 1000
+    ]
 
-    if len(closed) != 300:
-        raise ValueError(
-            f"{interval}: only {len(closed)} closed candles"
-        )
+    if len(closed) < 300:
+        raise ValueError(f"BingX {interval}: too few closed candles")
+
+    if len({c["open_time"] for c in closed}) != len(closed):
+        raise ValueError(f"BingX {interval}: duplicate candles")
 
     for previous, current in zip(closed, closed[1:]):
-        if int(current[0]) - int(previous[0]) != duration:
-            raise ValueError(f"{interval}: missing candles")
+        if current["open_time"] - previous["open_time"] != duration:
+            raise ValueError(f"BingX {interval}: gap in candles")
 
-    if now_ms - int(closed[-1][6]) > duration * 2:
-        raise ValueError(f"{interval}: stale data")
+    age = now_ms - (closed[-1]["close_time"] + 1)
 
-    return [
-        {
-            "open_time": int(row[0]),
-            "close_time": int(row[6]),
-            "open": row[1],
-            "high": row[2],
-            "low": row[3],
-            "close": row[4],
-            "volume": row[5],
-            "quote_volume": row[7],
-            "trades": int(row[8]),
-        }
-        for row in closed
-    ]
+    if not 0 <= age <= 2 * duration + 60_000:
+        raise ValueError(f"BingX {interval}: stale candles ({age} ms)")
+
+    return closed
 
 
 def main():
     result = {
         "symbol": SYMBOL,
-        "market": "Binance USD-M Futures",
+        "market": "BingX USDT-margined perpetual",
+        "source": BASE_URL,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "candles": {},
     }
 
     for interval, duration in INTERVALS.items():
-        result["candles"][interval] = fetch_candles(
-            interval, duration
-        )
-        print(
-            interval,
-            "OK",
-            len(result["candles"][interval]),
-        )
+        candles = fetch_candles(interval, duration)
+        result["candles"][interval] = candles
+        print(interval, "OK", len(candles), "last closed", candles[-1]["close_time"])
 
     Path("market_data.json").write_text(
-        json.dumps(
-            result,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ),
+        json.dumps(result, ensure_ascii=False, separators=(",", ":")),
         encoding="utf-8",
     )
 
